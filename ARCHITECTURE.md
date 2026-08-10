@@ -80,8 +80,14 @@ func (s *Sequelize) Close() error
 type Attributes map[string]Attribute
 
 type Attribute struct {
-	Type          DataType
-	AllowNull     bool // mirrors upstream: default is nullable, so the zero value is nullable
+	Type DataType
+	// AllowNull is a *bool, not a bool. An earlier draft of this file said
+	// "bool, and the zero value means nullable" — which is self-contradictory,
+	// because it leaves no value that means NOT NULL. Nil means nullable
+	// (upstream's default); use the NotNull() / Null() helpers to be explicit.
+	// The upshot is that `AllowNull: false` is a compile error rather than a
+	// silent wrong answer.
+	AllowNull     *bool
 	PrimaryKey    bool
 	AutoIncrement bool
 	Unique        bool
@@ -119,9 +125,13 @@ Get these right; they are where ports usually drift, and each one is a parity ca
 - **Paranoid deletes.** With `Paranoid(true)`, `Destroy` sets `deletedAt` and every
   finder adds `deletedAt IS NULL` unless `Paranoid(false)` is passed on the query.
   `Restore` clears it.
-- **Table naming.** Upstream pluralises the model name for the table and
-  camelCases attributes to columns; be explicit about the rule you implement and
-  record it. `TableName(...)` and `Attribute.Field` must override it.
+- **Naming.** Attribute keys are **snake_cased** to column names (`createdAt` →
+  `created_at`), and the table is the model name snake_cased then pluralised
+  (`UserProfile` → `user_profiles`). An earlier draft of this file said
+  "camelCases attributes to columns" in this section while `Attribute.Field`
+  said snake_case; snake_case is the rule, and the deviation from upstream's
+  camelCase columns is recorded in `API-DEVIATIONS.md`. `TableName(...)` and
+  `Attribute.Field` override both.
 - **`FindOrCreate` is atomic** — inside a transaction, and it reports whether it
   created.
 - **`Upsert` reports whether it inserted.**
