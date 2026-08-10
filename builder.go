@@ -35,16 +35,50 @@ type Include struct {
 	// Where filters the associated rows. For a joined association it becomes an
 	// extra ON condition, so it narrows the association without dropping parents.
 	Where *Clause
-	// Attrs restricts which of the associated model's attributes are selected. The
-	// target's primary key, and any key needed to stitch the rows together, are
-	// selected regardless.
+	// Attrs restricts which of the associated model's attributes are selected — it
+	// is upstream's per-include `attributes`. The target's primary key, and any key
+	// needed to stitch the rows together, are selected regardless.
 	Attrs []string
-	// Required makes a joined association an INNER JOIN, dropping parents with no
-	// match. It has no effect on the batched to-many kinds, which cannot express it
-	// without a subquery.
+	// Required drops parents that have no matching associated row.
+	//
+	// For the joined kinds (BelongsTo, HasOne) it is an INNER JOIN. For the batched
+	// to-many kinds (HasMany, BelongsToMany) a join is not available — the children
+	// arrive in a query of their own — so it becomes a subquery filter on the
+	// parent select, `parentKey IN (SELECT foreignKey FROM children ...)`, which is
+	// what upstream's `required` means there. Required on a nested include
+	// propagates upwards, as upstream's does: an ancestor with no qualifying
+	// descendant is dropped too.
 	Required bool
+	// Order sorts the associated rows of a batched to-many association. It is
+	// meaningless for the joined kinds, which yield at most one row per parent, and
+	// setting it there is an error wrapping [ErrUnsupported].
+	//
+	// Ordering associated rows needs a result set of their own, so it is honoured by
+	// [Model.FindAllEager] rather than by [Model.FindAll]; see [Include.Limit].
+	Order []OrderTerm
+	// Limit caps the number of associated rows kept *per parent*, not across the
+	// whole batch — upstream's `separate: true` + `limit` semantics. Use [Int] to
+	// set it.
+	//
+	// A plain LIMIT on the batched IN (...) query would truncate the combined
+	// result, so this is implemented with a window function where the dialect has
+	// one and by trimming a single batched result set otherwise; either way it costs
+	// one query for the whole batch. Because it needs a loader that knows about it,
+	// it is honoured by [Model.FindAllEager]; [Model.FindAll] rejects it with an
+	// error wrapping [ErrUnsupported] rather than silently ignoring it.
+	Limit *int
+	// Offset skips associated rows per parent, with the same caveats as
+	// [Include.Limit]. Use [Int] to set it.
+	Offset *int
 	// Include nests further eager loading, to any depth.
 	Include []Include
+}
+
+// hasChildOptions reports whether the include asks for something that only a
+// result set of the children's own can provide: an order, a per-parent limit or a
+// per-parent offset.
+func (inc Include) hasChildOptions() bool {
+	return len(inc.Order) > 0 || inc.Limit != nil || inc.Offset != nil
 }
 
 // Query describes one read or write. Every finder and mutation is built from it,
@@ -118,6 +152,44 @@ type builder struct {
 	alias string
 	sb    strings.Builder
 	args  []any
+	// markers switches bind and bindRaw from writing the dialect's placeholder to
+	// writing a substitution marker (see rawSubDelim), so that a fragment can be
+	// rendered before its final bind-parameter positions are known and spliced into
+	// a larger statement later. Only the package's own subquery construction turns
+	// it on; see include_opts.go.
+	markers bool
+}
+
+// The substitution vocabulary of a package-built raw clause.
+//
+// A [Clause] of kind clauseRaw normally carries SQL text the caller wrote, with
+// the caller's own placeholders. The package also needs to build raw fragments of
+// its own — the subquery an [Include] with Required expands to — and those cannot
+// know their bind-parameter positions, nor the table alias their parent columns
+// will be qualified by, until the enclosing statement is rendered. So a
+// package-built fragment writes markers instead and clause resolves them at
+// render time.
+//
+// The delimiter is a NUL byte, which ValidateIdentifier rejects and no caller
+// would put in a Literal, so a caller-written fragment can never be mistaken for
+// one of these.
+const (
+	// rawSubDelim brackets every substitution.
+	rawSubDelim = "\x00"
+	// rawSubBind stands for "bind the next argument here".
+	rawSubBind = "?"
+	// rawSubColumn prefixes an attribute name to render as an alias-qualified
+	// column of the model the clause is being rendered against.
+	rawSubColumn = "c:"
+)
+
+// rawBindMarker is what bind and bindRaw write in marker mode.
+const rawBindMarker = rawSubDelim + rawSubBind + rawSubDelim
+
+// rawColumnMarker renders the substitution that becomes an alias-qualified column
+// of the enclosing statement's own model.
+func rawColumnMarker(attribute string) string {
+	return rawSubDelim + rawSubColumn + attribute + rawSubDelim
 }
 
 func newBuilder(m *Model) *builder {
@@ -145,6 +217,13 @@ func (b *builder) bind(attribute string, value any) error {
 	if err != nil {
 		return err
 	}
+	if b.markers {
+		// The final BindValue is left to whoever splices the fragment in, which is
+		// where the argument's position becomes known.
+		b.args = append(b.args, encoded)
+		b.sb.WriteString(rawBindMarker)
+		return nil
+	}
 	bound, err := b.d.BindValue(t, encoded)
 	if err != nil {
 		return err
@@ -157,6 +236,11 @@ func (b *builder) bind(attribute string, value any) error {
 // bindRaw appends a value with no attribute type to guide encoding, for literal
 // clauses and LIMIT/OFFSET.
 func (b *builder) bindRaw(value any) error {
+	if b.markers {
+		b.args = append(b.args, value)
+		b.sb.WriteString(rawBindMarker)
+		return nil
+	}
 	bound, err := b.d.BindValue(DataType{}, value)
 	if err != nil {
 		return err
@@ -282,6 +366,16 @@ func (b *builder) clause(c *Clause) error {
 		b.write(")")
 		return nil
 	case clauseRaw:
+		if strings.Contains(c.sql, rawSubDelim) {
+			return b.rawWithSubstitutions(c)
+		}
+		if b.markers {
+			// A caller-written Literal carries the caller's own placeholders, which
+			// cannot be renumbered when the fragment is spliced into a larger
+			// statement. Refuse rather than emit a statement whose arguments are in
+			// the wrong order.
+			return fmt.Errorf("%w: a raw Literal cannot be rendered inside a generated subquery", ErrUnsupported)
+		}
 		b.write("(", c.sql, ")")
 		for _, arg := range c.args {
 			bound, err := b.d.BindValue(DataType{}, arg)
@@ -296,21 +390,72 @@ func (b *builder) clause(c *Clause) error {
 	}
 }
 
+// rawWithSubstitutions renders a package-built raw clause, resolving its
+// substitution markers against the statement being written: a bind marker becomes
+// the next argument's placeholder at its real position, and a column marker
+// becomes an alias-qualified column of the current model.
+//
+// The text is split on the delimiter, so every odd element is a marker and every
+// even one is literal SQL. Arguments are consumed in the order their markers
+// appear, which is the order the fragment appended them in.
+func (b *builder) rawWithSubstitutions(c *Clause) error {
+	parts := strings.Split(c.sql, rawSubDelim)
+	if len(parts)%2 == 0 {
+		return fmt.Errorf("%w: unbalanced substitution in a generated clause", ErrInvalidQuery)
+	}
+	next := 0
+	b.write("(")
+	for i, part := range parts {
+		if i%2 == 0 {
+			b.write(part)
+			continue
+		}
+		switch {
+		case part == rawSubBind:
+			if next >= len(c.args) {
+				return fmt.Errorf("%w: generated clause has more placeholders than arguments", ErrInvalidQuery)
+			}
+			if err := b.bindRaw(c.args[next]); err != nil {
+				return err
+			}
+			next++
+		case strings.HasPrefix(part, rawSubColumn):
+			if err := b.column(strings.TrimPrefix(part, rawSubColumn)); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("%w: unrecognised substitution %q in a generated clause", ErrInvalidQuery, part)
+		}
+	}
+	b.write(")")
+	if next != len(c.args) {
+		return fmt.Errorf("%w: generated clause has %d arguments for %d placeholders",
+			ErrInvalidQuery, len(c.args), next)
+	}
+	return nil
+}
+
 // effectiveWhere combines a query's own filter with the model's soft-delete
-// filter. Paranoid models hide stamped rows unless the query sets Paranoid to
-// false.
+// filter and with the subquery filters an [Include] with Required contributes.
+// Paranoid models hide stamped rows unless the query sets Paranoid to false.
 func (m *Model) effectiveWhere(q Query) *Clause {
+	where := q.Where
+	if len(q.Include) > 0 {
+		if required := m.includeRequiredClause(q); required != nil {
+			where = And(where, required)
+		}
+	}
 	if !m.IsParanoid() {
-		return q.Where
+		return where
 	}
 	if q.Paranoid != nil && !*q.Paranoid {
-		return q.Where
+		return where
 	}
 	notDeleted := Op.IsNull(m.DeletedAtName())
-	if q.Where == nil {
+	if where == nil {
 		return notDeleted
 	}
-	return And(q.Where, notDeleted)
+	return And(where, notDeleted)
 }
 
 // selectColumns resolves the attribute list a select should project.
@@ -373,7 +518,17 @@ func (b *builder) writeTail(q Query, withOrder bool) error {
 	return b.writeLimit(q)
 }
 
+// writeLimit appends LIMIT and OFFSET.
+//
+// It is also where every read path's include options are validated: writeTail
+// ends here, and the aggregate builders call it directly, so it is the one place
+// every SELECT the package emits passes through with its [Query] in hand. An
+// include option the path cannot honour is an error here rather than a silently
+// dropped request.
 func (b *builder) writeLimit(q Query) error {
+	if err := b.m.checkIncludes(q); err != nil {
+		return err
+	}
 	if q.Limit == nil && q.Offset == nil {
 		return nil
 	}

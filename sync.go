@@ -12,6 +12,15 @@ type SyncOptions struct {
 	// Force drops each table before recreating it, losing its data. It is
 	// upstream's `force: true`.
 	Force bool
+	// Alter migrates an existing table towards the model instead of leaving it
+	// alone. See [Alter] for exactly which differences are applied.
+	Alter bool
+	// AlterDrop permits the destructive half of an alter: dropping a column the
+	// model no longer declares. See [AlterDrop].
+	AlterDrop bool
+	// AlterRebuild permits the copy-and-rename table rebuild that a retype, a
+	// nullability change or a default change needs on SQLite. See [AlterRebuild].
+	AlterRebuild bool
 	// Tx runs the DDL inside a transaction. Not every backend makes DDL
 	// transactional; SQLite does.
 	Tx *Tx
@@ -42,10 +51,12 @@ func resolveSyncOptions(opts []SyncOption) SyncOptions {
 }
 
 // Sync creates the table for every defined model, in definition order, plus each
-// model's indexes. Existing tables are left alone unless [Force] is passed.
+// model's indexes.
 //
-// Sync never alters an existing table: there is no ALTER path in v0.1.0, so a
-// model whose attributes changed needs Force or a migration written by hand.
+// An existing table is left alone unless [Force] or [Alter] is passed: Force
+// drops and recreates it, losing its data, while Alter migrates it towards the
+// model. Without either, a model whose attributes changed needs a migration
+// written by hand.
 func (s *Sequelize) Sync(ctx context.Context, opts ...SyncOption) error {
 	o := resolveSyncOptions(opts)
 	for _, m := range s.definedModels() {
@@ -69,7 +80,9 @@ func (s *Sequelize) Drop(ctx context.Context, opts ...SyncOption) error {
 	return nil
 }
 
-// Sync creates the model's table if it does not exist, then its indexes.
+// Sync creates the model's table if it does not exist, then its indexes. With
+// [Alter] an existing table is migrated towards the model instead of being left
+// alone; see [Model.AlterTable].
 func (m *Model) Sync(ctx context.Context, opts ...SyncOption) error {
 	return m.syncWith(ctx, resolveSyncOptions(opts))
 }
@@ -82,6 +95,13 @@ func (m *Model) syncWith(ctx context.Context, o SyncOptions) error {
 		if err := m.dropWith(ctx, o); err != nil {
 			return err
 		}
+	} else if o.Alter {
+		// AlterTable creates the table when it does not exist yet, so the
+		// create path below has nothing left to do either way.
+		if _, err := m.alterTableWith(ctx, o); err != nil {
+			return err
+		}
+		return nil
 	}
 	ddl, err := m.CreateTableSQL()
 	if err != nil {
@@ -154,63 +174,30 @@ func (m *Model) DropTableSQL() (string, error) {
 // identifier in it has been validated, and the only literals it can contain are
 // the scalar defaults described on [Attribute.DefaultValue].
 func (m *Model) CreateTableSQL() (string, error) {
+	return m.createTableSQL(m.table)
+}
+
+// createTableSQL renders the model's CREATE TABLE against an arbitrary table
+// name. Everything but the name comes from the model, which is what the SQLite
+// table rebuild in sync_alter.go needs: it builds the target schema under a
+// temporary name, copies the rows across, and renames.
+func (m *Model) createTableSQL(tableName string) (string, error) {
 	if err := m.Err(); err != nil {
 		return "", err
 	}
 	d := m.seq.dialect
-	table, err := d.Quote(m.table)
+	table, err := d.Quote(tableName)
 	if err != nil {
 		return "", err
 	}
 	singlePK := len(m.pk) == 1
 	defs := make([]string, 0, len(m.names)+1)
 	for _, name := range m.names {
-		attr := m.attrs[name]
-		col, err := d.Quote(attr.Field)
+		def, err := m.columnDefinition(name)
 		if err != nil {
 			return "", err
 		}
-		if singlePK && m.pk[0] == name && attr.AutoIncrement {
-			def, err := d.AutoIncrementColumn(col, attr.Type)
-			if err != nil {
-				return "", err
-			}
-			defs = append(defs, def)
-			continue
-		}
-		var def strings.Builder
-		sqlType, err := d.ColumnType(attr.Type)
-		if err != nil {
-			return "", err
-		}
-		def.WriteString(col)
-		def.WriteString(" ")
-		def.WriteString(sqlType)
-		if singlePK && m.pk[0] == name {
-			def.WriteString(" PRIMARY KEY")
-		}
-		if !attr.Nullable() {
-			def.WriteString(" NOT NULL")
-		}
-		if attr.Unique {
-			def.WriteString(" UNIQUE")
-		}
-		if attr.DefaultValue != nil {
-			literal, err := defaultLiteral(attr.DefaultValue)
-			if err != nil {
-				return "", fmt.Errorf("default for %s.%s: %w", m.name, name, err)
-			}
-			def.WriteString(" DEFAULT ")
-			def.WriteString(literal)
-		}
-		if attr.References != nil {
-			ref, err := m.referenceClause(attr.References)
-			if err != nil {
-				return "", fmt.Errorf("reference on %s.%s: %w", m.name, name, err)
-			}
-			def.WriteString(ref)
-		}
-		defs = append(defs, def.String())
+		defs = append(defs, def)
 	}
 	if !singlePK && len(m.pk) > 0 {
 		cols := make([]string, 0, len(m.pk))
@@ -226,28 +213,66 @@ func (m *Model) CreateTableSQL() (string, error) {
 	return "CREATE TABLE IF NOT EXISTS " + table + " (" + strings.Join(defs, ", ") + ")", nil
 }
 
+// columnDefinition renders one attribute's column definition exactly as
+// [Model.CreateTableSQL] writes it, inline PRIMARY KEY and all. It is shared
+// with the ALTER TABLE ... ADD COLUMN path in sync_alter.go, which only ever
+// asks for non-primary-key columns, so the two renderings cannot drift.
+func (m *Model) columnDefinition(name string) (string, error) {
+	attr, ok := m.attrs[name]
+	if !ok {
+		return "", fmt.Errorf("%w: %s.%s", ErrUnknownAttribute, m.name, name)
+	}
+	d := m.seq.dialect
+	col, err := d.Quote(attr.Field)
+	if err != nil {
+		return "", err
+	}
+	singlePK := len(m.pk) == 1 && m.pk[0] == name
+	if singlePK && attr.AutoIncrement {
+		return d.AutoIncrementColumn(col, attr.Type)
+	}
+	var def strings.Builder
+	sqlType, err := d.ColumnType(attr.Type)
+	if err != nil {
+		return "", err
+	}
+	def.WriteString(col)
+	def.WriteString(" ")
+	def.WriteString(sqlType)
+	if singlePK {
+		def.WriteString(" PRIMARY KEY")
+	}
+	if !attr.Nullable() {
+		def.WriteString(" NOT NULL")
+	}
+	if attr.Unique {
+		def.WriteString(" UNIQUE")
+	}
+	if attr.DefaultValue != nil {
+		literal, err := defaultLiteral(attr.DefaultValue)
+		if err != nil {
+			return "", fmt.Errorf("default for %s.%s: %w", m.name, name, err)
+		}
+		def.WriteString(" DEFAULT ")
+		def.WriteString(literal)
+	}
+	if attr.References != nil {
+		ref, err := m.referenceClause(attr.References)
+		if err != nil {
+			return "", fmt.Errorf("reference on %s.%s: %w", m.name, name, err)
+		}
+		def.WriteString(ref)
+	}
+	return def.String(), nil
+}
+
 // referenceClause renders " REFERENCES <table> (<column>)" plus any referential
 // actions.
 func (m *Model) referenceClause(ref *Reference) (string, error) {
 	d := m.seq.dialect
-	table := ref.Table
-	key := ref.Key
-	if ref.Model != nil {
-		if err := ref.Model.Err(); err != nil {
-			return "", err
-		}
-		if table == "" {
-			table = ref.Model.TableName()
-		}
-		if key == "" {
-			if len(ref.Model.pk) != 1 {
-				return "", fmt.Errorf("%w: referenced model %s has no single-column primary key", ErrNoPrimaryKey, ref.Model.name)
-			}
-			key = ref.Model.attrs[ref.Model.pk[0]].Field
-		}
-	}
-	if table == "" || key == "" {
-		return "", fmt.Errorf("%w: reference needs a table and a key", ErrInvalidQuery)
+	table, key, err := resolveReference(ref)
+	if err != nil {
+		return "", err
 	}
 	quotedTable, err := d.Quote(table)
 	if err != nil {
@@ -275,6 +300,33 @@ func (m *Model) referenceClause(ref *Reference) (string, error) {
 	return out, nil
 }
 
+// resolveReference resolves a [Reference] to the physical table and column it
+// points at, filling either in from Reference.Model when it was left empty. The
+// foreign-key diff in sync_alter.go compares against the same pair the DDL
+// emits.
+func resolveReference(ref *Reference) (table, key string, err error) {
+	table = ref.Table
+	key = ref.Key
+	if ref.Model != nil {
+		if err := ref.Model.Err(); err != nil {
+			return "", "", err
+		}
+		if table == "" {
+			table = ref.Model.TableName()
+		}
+		if key == "" {
+			if len(ref.Model.pk) != 1 {
+				return "", "", fmt.Errorf("%w: referenced model %s has no single-column primary key", ErrNoPrimaryKey, ref.Model.name)
+			}
+			key = ref.Model.attrs[ref.Model.pk[0]].Field
+		}
+	}
+	if table == "" || key == "" {
+		return "", "", fmt.Errorf("%w: reference needs a table and a key", ErrInvalidQuery)
+	}
+	return table, key, nil
+}
+
 // referentialAction validates a referential action as a sequence of bare words,
 // so that nothing but SQL keywords can reach the statement.
 func referentialAction(action string) (string, error) {
@@ -296,40 +348,20 @@ func (m *Model) CreateIndexSQL() ([]string, error) {
 	if err := m.Err(); err != nil {
 		return nil, err
 	}
-	d := m.seq.dialect
-	table, err := d.Quote(m.table)
+	// declaredIndexes and createIndexSQL live in sync_alter.go, which needs the
+	// same two halves separately: the resolved index shapes to diff against the
+	// live schema, and the rendering to recreate one on a rebuilt table.
+	indexes, err := m.declaredIndexes()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(m.opts.Indexes))
-	for _, idx := range m.opts.Indexes {
-		cols := make([]string, 0, len(idx.Fields))
-		rawCols := make([]string, 0, len(idx.Fields))
-		for _, field := range idx.Fields {
-			attr, ok := m.attrs[field]
-			if !ok {
-				return nil, fmt.Errorf("%w: index on %s names %q", ErrUnknownAttribute, m.name, field)
-			}
-			quoted, err := d.Quote(attr.Field)
-			if err != nil {
-				return nil, err
-			}
-			cols = append(cols, quoted)
-			rawCols = append(rawCols, attr.Field)
-		}
-		name := idx.Name
-		if name == "" {
-			name = "idx_" + m.table + "_" + strings.Join(rawCols, "_")
-		}
-		quotedName, err := d.Quote(name)
+	out := make([]string, 0, len(indexes))
+	for _, idx := range indexes {
+		stmt, err := m.createIndexSQL(idx)
 		if err != nil {
 			return nil, err
 		}
-		unique := ""
-		if idx.Unique {
-			unique = "UNIQUE "
-		}
-		out = append(out, "CREATE "+unique+"INDEX IF NOT EXISTS "+quotedName+" ON "+table+" ("+strings.Join(cols, ", ")+")")
+		out = append(out, stmt)
 	}
 	return out, nil
 }

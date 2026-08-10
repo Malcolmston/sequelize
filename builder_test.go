@@ -379,20 +379,107 @@ func TestValuesNeverReachTheSQLText(t *testing.T) {
 	}
 }
 
-func TestBuildSelectLeavesIncludesToTheEagerLoader(t *testing.T) {
-	// Eager loading is planned by findAllIncluded, which builds its own aliased,
+// builderAssocModels defines a parent with a to-many association, for the include
+// cases the single-table builder does have to answer for.
+func builderAssocModels(t *testing.T) (*Model, *Model) {
+	t.Helper()
+	db := newTestDB(t)
+	parent := db.Define("Owner", Attributes{"name": {Type: STRING(20)}}, Timestamps(false))
+	child := db.Define("Item", Attributes{
+		"label":   {Type: STRING(20)},
+		"ownerId": {Type: INTEGER()},
+	}, Timestamps(false))
+	if a := parent.HasMany(child); a.Err() != nil {
+		t.Fatalf("HasMany: %v", a.Err())
+	}
+	return parent, child
+}
+
+func TestBuildSelectLeavesJoinsToTheEagerLoader(t *testing.T) {
+	// Eager loading is planned by the include loader, which builds its own aliased,
 	// joined statement; the single-table builder deliberately renders the same SQL
-	// with or without an Include, and never sees one in practice.
-	m := builderModel(t)
-	with, _, _, err := m.buildSelect(Query{Include: []Include{{Association: "Nothing"}}})
+	// whether or not an Include is present, because an include that only asks for
+	// extra rows does not change which parents match.
+	parent, _ := builderAssocModels(t)
+	with, _, _, err := parent.buildSelect(Query{Include: []Include{{Association: "items"}}})
 	if err != nil {
 		t.Fatalf("buildSelect with Include: %v", err)
 	}
-	without, _, _, err := m.buildSelect(Query{})
+	without, _, _, err := parent.buildSelect(Query{})
 	if err != nil {
 		t.Fatalf("buildSelect: %v", err)
 	}
 	if with != without {
 		t.Errorf("the single-table builder acted on an Include:\n%q\n%q", with, without)
+	}
+}
+
+func TestBuildSelectAppliesRequiredIncludeAsASubquery(t *testing.T) {
+	// A Required to-many include cannot be a join — the children come back in a
+	// query of their own — so it has to narrow the parent select itself.
+	parent, _ := builderAssocModels(t)
+	sql, args, _, err := parent.buildSelect(Query{Include: []Include{{Association: "items", Required: true}}})
+	if err != nil {
+		t.Fatalf("buildSelect: %v", err)
+	}
+	if !strings.Contains(sql, `"id" IN (SELECT "owner_id" FROM "items"`) {
+		t.Errorf("Required include did not become a subquery filter:\n%s", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args = %v, want none for an unfiltered Required include", args)
+	}
+}
+
+func TestBuildSelectRejectsAnUnknownIncludedAssociation(t *testing.T) {
+	parent, _ := builderAssocModels(t)
+	_, _, _, err := parent.buildSelect(Query{Include: []Include{{Association: "Nothing"}}})
+	if !errors.Is(err, ErrInvalidQuery) {
+		t.Errorf("buildSelect with an unknown association = %v, want ErrInvalidQuery", err)
+	}
+}
+
+func TestRawSubstitutionsAreRenderedInOrder(t *testing.T) {
+	// The substitution vocabulary is what lets a generated subquery be spliced into
+	// a statement whose bind positions are not known when the subquery is built.
+	m := builderModel(t)
+	b := newBuilder(m)
+	c := &Clause{
+		kind: clauseRaw,
+		sql:  rawColumnMarker("name") + " = " + rawBindMarker + " AND " + rawColumnMarker("price") + " > " + rawBindMarker,
+		args: []any{"x", int64(3)},
+	}
+	if err := b.clause(c); err != nil {
+		t.Fatalf("clause: %v", err)
+	}
+	if got, want := b.sb.String(), `("name" = ? AND "price" > ?)`; got != want {
+		t.Errorf("rendered %q, want %q", got, want)
+	}
+	if len(b.args) != 2 || b.args[0] != "x" || b.args[1] != int64(3) {
+		t.Errorf("args = %v, want [x 3] in marker order", b.args)
+	}
+}
+
+func TestRawSubstitutionsRejectAMismatch(t *testing.T) {
+	m := builderModel(t)
+	b := newBuilder(m)
+	tooFew := &Clause{kind: clauseRaw, sql: rawBindMarker + " " + rawBindMarker, args: []any{1}}
+	if err := b.clause(tooFew); !errors.Is(err, ErrInvalidQuery) {
+		t.Errorf("too few arguments = %v, want ErrInvalidQuery", err)
+	}
+	b = newBuilder(m)
+	unknown := &Clause{kind: clauseRaw, sql: rawSubDelim + "z:nope" + rawSubDelim}
+	if err := b.clause(unknown); !errors.Is(err, ErrInvalidQuery) {
+		t.Errorf("unknown substitution = %v, want ErrInvalidQuery", err)
+	}
+}
+
+func TestMarkerModeRefusesACallerLiteral(t *testing.T) {
+	// A caller's Literal carries the caller's own placeholders, which cannot be
+	// renumbered; rendering it into a generated fragment would misplace its args.
+	m := builderModel(t)
+	b := newBuilder(m)
+	b.markers = true
+	if err := b.clause(Literal("name = ?", "x")); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("Literal in marker mode = %v, want ErrUnsupported", err)
 	}
 }
