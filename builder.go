@@ -298,6 +298,9 @@ func (b *builder) clause(c *Clause) error {
 		}
 		return nil
 	case clauseCompare:
+		if !DialectSupportsOperator(b.d, c.op) {
+			return fmt.Errorf("%w: %s cannot render %s", ErrUnsupported, b.d.Name(), c.op)
+		}
 		if err := b.column(c.attribute); err != nil {
 			return err
 		}

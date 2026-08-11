@@ -168,6 +168,22 @@ func TestBuildSelectRejectsUnknownAttributes(t *testing.T) {
 	}
 }
 
+// A comparison operator the dialect cannot render must fail at build time with a
+// clear ErrUnsupported, not emit SQL the driver rejects at execution. On SQLite,
+// ILIKE has no spelling.
+func TestBuildSelectRejectsUnsupportedOperator(t *testing.T) {
+	m := builderModel(t)
+	for _, c := range []*Clause{Op.ILike("tag", "%a%"), Op.NotILike("tag", "%a%")} {
+		if _, _, _, err := m.buildSelect(Query{Where: c}); !errors.Is(err, ErrUnsupported) {
+			t.Errorf("buildSelect with %s = %v, want ErrUnsupported", c.op, err)
+		}
+	}
+	// A portable operator on the same dialect still renders.
+	if _, _, _, err := m.buildSelect(Query{Where: Op.Like("tag", "%a%")}); err != nil {
+		t.Errorf("Op.Like should render on SQLite: %v", err)
+	}
+}
+
 func TestBuildSelectRejectsNegativeLimits(t *testing.T) {
 	m := builderModel(t)
 	if _, _, _, err := m.buildSelect(Query{Limit: Int(-1)}); !errors.Is(err, ErrInvalidQuery) {
